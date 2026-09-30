@@ -52,6 +52,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.apktest.data.train.LiveTrainRepository
+import com.example.apktest.widget.StationDropdown
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.android.Android
@@ -85,7 +87,9 @@ data class TrainData(
     val name:String,
     val fromStnCode:String,
     val toStnCode:String,
-
+    val departureTime: String? = null,
+    val arrivalTime: String? = null,
+    val travelTime: String? = null
 )
 @Composable
 fun TrainSelector(viewModel: TrainViewModel = viewModel(), onNavigateToLiveScreen: (trainNo:String) -> Unit) {
@@ -100,7 +104,12 @@ fun TrainSelector(viewModel: TrainViewModel = viewModel(), onNavigateToLiveScree
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
 
-            SearchTab(query = trainQuery, onQueryChange = {trainQuery=it}, onSearch = {viewModel.loadTrains(trainQuery)})
+            SearchTab(
+                query = trainQuery, 
+                onQueryChange = {trainQuery=it}, 
+                onSearch = {viewModel.loadTrains(trainQuery)},
+                onSearchBetween = { from, to -> viewModel.loadTrainsBetween(from, to) }
+            )
 
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -141,6 +150,7 @@ data class TrainUiState(
 
 class TrainViewModel : ViewModel() {
     private val repository = TrainRepository()
+    private val liveRepo = LiveTrainRepository()
 
     private val _uiState = MutableStateFlow(TrainUiState())
     val uiState: StateFlow<TrainUiState> = _uiState.asStateFlow()
@@ -156,7 +166,39 @@ class TrainViewModel : ViewModel() {
             try {
                 val response = repository.fetchTrains(query)
                 _uiState.update {
-                    it.copy(isLoading = false, trains = response?.data ?: emptyList())
+                    it.copy(isLoading = false, trains = response.data)
+                }
+            } catch (e: CancellationException) {
+                throw e // never swallow cancellation
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(isLoading = false, error = e.message ?: "Something went wrong")
+                }
+            }
+        }
+    }
+
+    fun loadTrainsBetween(from: String, to: String) {
+        if (from.isBlank() || to.isBlank()) return
+
+        searchJob?.cancel()
+        searchJob = viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true, error = null) }
+            try {
+                val response = liveRepo.fetchTrainsBetweenStations(from, to)
+                val trains = response.data?.trains?.map {
+                    TrainData(
+                        number = it.trainNo,
+                        name = it.trainName ?: "Unknown",
+                        fromStnCode = it.fromStnCode ?: from,
+                        toStnCode = it.toStnCode ?: to,
+                        departureTime = it.departureTime,
+                        arrivalTime = it.arrivalTime,
+                        travelTime = it.travelTime
+                    )
+                } ?: emptyList()
+                _uiState.update {
+                    it.copy(isLoading = false, trains = trains)
                 }
             } catch (e: CancellationException) {
                 throw e // never swallow cancellation
@@ -185,8 +227,12 @@ class TrainRepository {
 
 @Composable
 fun SearchCard(trainData: TrainData,onNavigateToLiveScreen: (trainNo:String) -> Unit){
-
-    Row(modifier = Modifier.clickable(onClick = { onNavigateToLiveScreen(trainData.number) })) {
+    Row(
+        modifier = Modifier
+            .clickable(onClick = { onNavigateToLiveScreen(trainData.number) })
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+    ) {
         Box(
             modifier = Modifier
                 .size(96.dp)
@@ -195,13 +241,28 @@ fun SearchCard(trainData: TrainData,onNavigateToLiveScreen: (trainNo:String) -> 
         ){
            Text(trainData.number, style = MaterialTheme.typography.headlineMedium)
         }
-Spacer(modifier= Modifier.width(8.dp))
-        Column() {
+        Spacer(modifier= Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
             Text(trainData.name, style = MaterialTheme.typography.bodyLarge)
-            Row() {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(trainData.fromStnCode)
                 Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "from to")
                 Text(trainData.toStnCode)
+            }
+            if (trainData.departureTime != null && trainData.arrivalTime != null) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Leaves ${trainData.fromStnCode} at ${trainData.departureTime} • Arrives ${trainData.toStnCode} at ${trainData.arrivalTime}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (trainData.travelTime != null) {
+                Text(
+                    text = "Travel time: ${trainData.travelTime}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
@@ -211,6 +272,7 @@ Spacer(modifier= Modifier.width(8.dp))
 fun FromTo(onSearch: (from: String, to: String) -> Unit = { _, _ -> }) {
     var from by rememberSaveable { mutableStateOf("") }
     var to by rememberSaveable { mutableStateOf("") }
+    val repo = remember { LiveTrainRepository() }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -218,29 +280,18 @@ fun FromTo(onSearch: (from: String, to: String) -> Unit = { _, _ -> }) {
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                TextField(
-                    value = from,
-                    onValueChange = { from = it },
-                    label = { Text("From station") },
-                    leadingIcon = { Icon(Icons.Default.Place, contentDescription = null) },
-                    singleLine = true,
-                    shape = MaterialTheme.shapes.large,
-                    colors = searchFieldColors(),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth()
+                StationDropdown(
+                    label = "From station",
+                    selectedCode = from,
+                    onCodeSelected = { from = it },
+                    repo = repo
                 )
                 Spacer(Modifier.height(8.dp))
-                TextField(
-                    value = to,
-                    onValueChange = { to = it },
-                    label = { Text("To station") },
-                    leadingIcon = { Icon(Icons.Default.LocationOn, contentDescription = null) },
-                    singleLine = true,
-                    shape = MaterialTheme.shapes.large,
-                    colors = searchFieldColors(),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = { onSearch(from, to) }),
-                    modifier = Modifier.fillMaxWidth()
+                StationDropdown(
+                    label = "To station",
+                    selectedCode = to,
+                    onCodeSelected = { to = it },
+                    repo = repo
                 )
             }
 
@@ -283,7 +334,8 @@ private fun searchFieldColors() = TextFieldDefaults.colors(
 fun SearchTab(
     query: String,
     onQueryChange: (String) -> Unit,
-    onSearch: (String) -> Unit
+    onSearch: (String) -> Unit,
+    onSearchBetween: (String, String) -> Unit = { _, _ -> }
 ) {
     var selected by rememberSaveable { mutableIntStateOf(0) }
     val titles = listOf("Name/No.", "From To")
@@ -328,7 +380,7 @@ fun SearchTab(
                 modifier = Modifier.fillMaxWidth()
             )
 
-            1 -> FromTo()
+            1 -> FromTo(onSearch = onSearchBetween)
         }
     }
 }
